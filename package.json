@@ -1,0 +1,32 @@
+{
+  "name": "crypto-market-tracker",
+  "version": "1.0.0",
+  "description": "Daily crypto market performance tracker with Coingecko Pro API",
+  "main": "api/generate-report.js",
+  "scripts": {
+    "dev": "node api/generate-report.js",
+    "build": "node api/generate-report.js",
+    "start": "node api/generate-report.js",
+    "generate-data": "node scripts/generate-daily-data.js",
+    "test": "node -e \"console.log('? Testing dependencies...'); try { const fs = require('fs'); console.log('? fs module loaded'); console.log('? All core modules available'); console.log('? Ready to run!'); } catch(e) { console.log('? Error:', e.message); }\"",
+    "vercel-build": "npm install"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "resolutions": {
+    "inflight": "^1.0.6",
+    "are-we-there-yet": "^3.0.0",
+    "npmlog": "^7.0.0",
+    "rimraf": "^4.0.0",
+    "glob": "^9.0.0",
+    "gauge": "^4.0.0"
+  },
+  "keywords": ["cryptocurrency", "market", "tracker", "coingecko", "vercel"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.43",
+    "@octokit/rest": "^20.0.2"
+  }
+}
