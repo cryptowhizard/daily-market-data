@@ -23,62 +23,59 @@ jobs:
       id: detect_pm
       shell: bash
       run: |
-        if [ -f package-lock.json ]; then
-          echo "manager=npm" >> $GITHUB_OUTPUT
+        if [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
           echo "has_lock=true" >> $GITHUB_OUTPUT
-          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
         elif [ -f yarn.lock ]; then
           echo "manager=yarn" >> $GITHUB_OUTPUT
           echo "has_lock=true" >> $GITHUB_OUTPUT
           echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
-        elif [ -f pnpm-lock.yaml ]; then
-          echo "manager=pnpm" >> $GITHUB_OUTPUT
+        elif [ -f package-lock.json ]; then
+          echo "manager=npm" >> $GITHUB_OUTPUT
           echo "has_lock=true" >> $GITHUB_OUTPUT
-          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
         else
           echo "manager=npm" >> $GITHUB_OUTPUT
           echo "has_lock=false" >> $GITHUB_OUTPUT
           echo "lockfile=" >> $GITHUB_OUTPUT
         fi
 
-    # Setup Node without cache when no lockfile is present
-    - name: Setup Node.js (no cache)
-      if: steps.detect_pm.outputs.has_lock != 'true'
-      uses: actions/setup-node@v4
-      with:
-        node-version: '18'
+    # Enable pnpm if detected
+    - name: Enable pnpm
+      if: steps.detect_pm.outputs.manager == 'pnpm'
+      run: corepack enable
 
-    # Setup Node with cache when a lockfile is present
-    - name: Setup Node.js (with cache)
-      if: steps.detect_pm.outputs.has_lock == 'true'
+    # Setup Node.js with conditional caching
+    - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        cache: ${{ steps.detect_pm.outputs.manager }}
-        cache-dependency-path: ${{ steps.detect_pm.outputs.lockfile }}
+        cache: ${{ steps.detect_pm.outputs.has_lock == 'true' && steps.detect_pm.outputs.manager || '' }}
+        cache-dependency-path: ${{ steps.detect_pm.outputs.has_lock == 'true' && steps.detect_pm.outputs.lockfile || '' }}
         
-    - name: Cache node modules
-      uses: actions/cache@v3
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node-${{ hashFiles('package.json') }}
-        restore-keys: |
-          ${{ runner.os }}-node-
-        
-    - name: Install dependencies (lock-file aware)
+    - name: Install dependencies
       shell: bash
       run: |
-        if [ -f package-lock.json ]; then
-          echo "Detected package-lock.json - running npm ci"
-          npm ci
-        elif [ -f yarn.lock ]; then
-          echo "Detected yarn.lock - running yarn install --frozen-lockfile"
-          corepack enable || true
-          yarn install --frozen-lockfile
-        else
-          echo "No lock file found - running npm install"
-          npm install
-        fi
+        case "${{ steps.detect_pm.outputs.manager }}" in
+          "pnpm")
+            echo "Installing with pnpm..."
+            pnpm install --frozen-lockfile
+            ;;
+          "yarn")
+            echo "Installing with yarn..."
+            yarn install --frozen-lockfile
+            ;;
+          "npm")
+            if [ "${{ steps.detect_pm.outputs.has_lock }}" == "true" ]; then
+              echo "Installing with npm ci..."
+              npm ci
+            else
+              echo "Installing with npm install..."
+              npm install
+            fi
+            ;;
+        esac
       
     - name: Generate crypto market data
       env:
