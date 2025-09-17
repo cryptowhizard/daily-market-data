@@ -2,94 +2,71 @@ name: Daily Crypto Data Generation
 
 on:
   schedule:
-    # Runs daily at 6:00 AM Eastern Time (11:00 AM UTC during EST, 10:00 AM UTC during EDT)
-    # Using 10:00 AM UTC to handle both EST and EDT automatically
     - cron: '0 10 * * *'
-  workflow_dispatch: # Allow manual triggering
+  workflow_dispatch:
 
 jobs:
   generate-data:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Detect package manager & lockfile
-      id: detect_pm
-      shell: bash
+        # Remove explicit token unless you need different permissions
+        fetch-depth: 0  # Important for git operations
+
+    - name: Detect package manager
+      id: detect-pm
       run: |
-        if [ -f pnpm-lock.yaml ]; then
-          echo "manager=pnpm" >> $GITHUB_OUTPUT
-          echo "has_lock=true" >> $GITHUB_OUTPUT
-          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+        if [ -f package-lock.json ]; then
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
         elif [ -f yarn.lock ]; then
           echo "manager=yarn" >> $GITHUB_OUTPUT
-          echo "has_lock=true" >> $GITHUB_OUTPUT
           echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
-        elif [ -f package-lock.json ]; then
-          echo "manager=npm" >> $GITHUB_OUTPUT
-          echo "has_lock=true" >> $GITHUB_OUTPUT
-          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+        elif [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
         else
           echo "manager=npm" >> $GITHUB_OUTPUT
-          echo "has_lock=false" >> $GITHUB_OUTPUT
-          echo "lockfile=" >> $GITHUB_OUTPUT
         fi
 
-    # Enable pnpm if detected
-    - name: Enable pnpm
-      if: steps.detect_pm.outputs.manager == 'pnpm'
-      run: corepack enable
-
-    # Setup Node.js with conditional caching
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        cache: ${{ steps.detect_pm.outputs.has_lock == 'true' && steps.detect_pm.outputs.manager || '' }}
-        cache-dependency-path: ${{ steps.detect_pm.outputs.has_lock == 'true' && steps.detect_pm.outputs.lockfile || '' }}
-        
+        cache: ${{ steps.detect-pm.outputs.manager }}
+        cache-dependency-path: ${{ steps.detect-pm.outputs.lockfile }}
+
     - name: Install dependencies
-      shell: bash
       run: |
-        case "${{ steps.detect_pm.outputs.manager }}" in
-          "pnpm")
-            echo "Installing with pnpm..."
-            pnpm install --frozen-lockfile
+        case ${{ steps.detect-pm.outputs.manager }} in
+          npm)
+            if [ -f package-lock.json ]; then npm ci; else npm install; fi
             ;;
-          "yarn")
-            echo "Installing with yarn..."
+          yarn)
+            corepack enable
             yarn install --frozen-lockfile
             ;;
-          "npm")
-            if [ "${{ steps.detect_pm.outputs.has_lock }}" == "true" ]; then
-              echo "Installing with npm ci..."
-              npm ci
-            else
-              echo "Installing with npm install..."
-              npm install
-            fi
+          pnpm)
+            corepack enable
+            pnpm install --frozen-lockfile
             ;;
         esac
-      
+
     - name: Generate crypto market data
       env:
         COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
       run: node scripts/generate-daily-data.js
-      
-    - name: Commit and push data
+
+    - name: Commit and push changes
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
         git add data/
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Daily crypto data update - $(date +'%Y-%m-%d')"
-          git push
-        fi
+        # Use --no-verify to skip pre-commit hooks if needed
+        git diff --staged --quiet || git commit -m "Daily crypto data update - $(date +'%Y-%m-%d')"
+        git push
