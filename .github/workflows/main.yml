@@ -18,11 +18,44 @@ jobs:
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        
-    - name: Setup Node.js
+    
+    - name: Detect package manager & lockfile
+      id: detect_pm
+      shell: bash
+      run: |
+        if [ -f package-lock.json ]; then
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+        elif [ -f yarn.lock ]; then
+          echo "manager=yarn" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
+        elif [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+        else
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "has_lock=false" >> $GITHUB_OUTPUT
+          echo "lockfile=" >> $GITHUB_OUTPUT
+        fi
+
+    # Setup Node without cache when no lockfile is present
+    - name: Setup Node.js (no cache)
+      if: steps.detect_pm.outputs.has_lock != 'true'
       uses: actions/setup-node@v4
       with:
         node-version: '18'
+
+    # Setup Node with cache when a lockfile is present
+    - name: Setup Node.js (with cache)
+      if: steps.detect_pm.outputs.has_lock == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: ${{ steps.detect_pm.outputs.manager }}
+        cache-dependency-path: ${{ steps.detect_pm.outputs.lockfile }}
         
     - name: Cache node modules
       uses: actions/cache@v3
