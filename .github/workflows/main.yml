@@ -15,47 +15,16 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        # Remove explicit token unless you need different permissions
         fetch-depth: 0  # Important for git operations
-
-    - name: Detect package manager
-      id: detect-pm
-      run: |
-        if [ -f package-lock.json ]; then
-          echo "manager=npm" >> $GITHUB_OUTPUT
-          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
-        elif [ -f yarn.lock ]; then
-          echo "manager=yarn" >> $GITHUB_OUTPUT
-          echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
-        elif [ -f pnpm-lock.yaml ]; then
-          echo "manager=pnpm" >> $GITHUB_OUTPUT
-          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
-        else
-          echo "manager=npm" >> $GITHUB_OUTPUT
-        fi
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        cache: ${{ steps.detect-pm.outputs.manager }}
-        cache-dependency-path: ${{ steps.detect-pm.outputs.lockfile }}
+        # No cache configuration
 
     - name: Install dependencies
-      run: |
-        case ${{ steps.detect-pm.outputs.manager }} in
-          npm)
-            if [ -f package-lock.json ]; then npm ci; else npm install; fi
-            ;;
-          yarn)
-            corepack enable
-            yarn install --frozen-lockfile
-            ;;
-          pnpm)
-            corepack enable
-            pnpm install --frozen-lockfile
-            ;;
-        esac
+      run: npm install
 
     - name: Generate crypto market data
       env:
@@ -67,6 +36,5 @@ jobs:
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
         git add data/
-        # Use --no-verify to skip pre-commit hooks if needed
         git diff --staged --quiet || git commit -m "Daily crypto data update - $(date +'%Y-%m-%d')"
         git push
