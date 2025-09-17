@@ -10,6 +10,8 @@ on:
 jobs:
   generate-data:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
     - name: Checkout repository
@@ -30,8 +32,20 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-node-
         
-    - name: Install dependencies
-      run: npm install
+    - name: Install dependencies (lock-file aware)
+      shell: bash
+      run: |
+        if [ -f package-lock.json ]; then
+          echo "Detected package-lock.json - running npm ci"
+          npm ci
+        elif [ -f yarn.lock ]; then
+          echo "Detected yarn.lock - running yarn install --frozen-lockfile"
+          corepack enable || true
+          yarn install --frozen-lockfile
+        else
+          echo "No lock file found - running npm install"
+          npm install
+        fi
       
     - name: Generate crypto market data
       env:
