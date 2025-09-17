@@ -2,39 +2,97 @@ name: Daily Crypto Data Generation
 
 on:
   schedule:
+    # Runs daily at 6:00 AM Eastern Time (11:00 AM UTC during EST, 10:00 AM UTC during EDT)
+    # Using 10:00 AM UTC to handle both EST and EDT automatically
     - cron: '0 10 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allow manual triggering
 
 jobs:
   generate-data:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
+    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Important for git operations
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Detect package manager & lockfile
+      id: detect_pm
+      shell: bash
+      run: |
+        if [ -f package-lock.json ]; then
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=package-lock.json" >> $GITHUB_OUTPUT
+        elif [ -f yarn.lock ]; then
+          echo "manager=yarn" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=yarn.lock" >> $GITHUB_OUTPUT
+        elif [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> $GITHUB_OUTPUT
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+          echo "lockfile=pnpm-lock.yaml" >> $GITHUB_OUTPUT
+        else
+          echo "manager=npm" >> $GITHUB_OUTPUT
+          echo "has_lock=false" >> $GITHUB_OUTPUT
+          echo "lockfile=" >> $GITHUB_OUTPUT
+        fi
 
-    - name: Setup Node.js
+    # Setup Node without cache when no lockfile is present
+    - name: Setup Node.js (no cache)
+      if: steps.detect_pm.outputs.has_lock != 'true'
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        # No cache configuration
 
-    - name: Install dependencies
-      run: npm install
-
+    # Setup Node with cache when a lockfile is present
+    - name: Setup Node.js (with cache)
+      if: steps.detect_pm.outputs.has_lock == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: ${{ steps.detect_pm.outputs.manager }}
+        cache-dependency-path: ${{ steps.detect_pm.outputs.lockfile }}
+        
+    - name: Cache node modules
+      uses: actions/cache@v3
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('package.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+        
+    - name: Install dependencies (lock-file aware)
+      shell: bash
+      run: |
+        if [ -f package-lock.json ]; then
+          echo "Detected package-lock.json - running npm ci"
+          npm ci
+        elif [ -f yarn.lock ]; then
+          echo "Detected yarn.lock - running yarn install --frozen-lockfile"
+          corepack enable || true
+          yarn install --frozen-lockfile
+        else
+          echo "No lock file found - running npm install"
+          npm install
+        fi
+      
     - name: Generate crypto market data
       env:
         COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
       run: node scripts/generate-daily-data.js
-
-    - name: Commit and push changes
+      
+    - name: Commit and push data
       run: |
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
         git add data/
-        git diff --staged --quiet || git commit -m "Daily crypto data update - $(date +'%Y-%m-%d')"
-        git push
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Daily crypto data update - $(date +'%Y-%m-%d')"
+          git push
+        fi
