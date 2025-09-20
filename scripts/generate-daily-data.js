@@ -30,6 +30,200 @@ class CryptoDataGenerator {
     console.log(`   - Base URL: ${this.BASE_URL}`);
   }
 
+  // === Technical helpers reused from API ===
+  calculateEMA(prices, period) {
+    const k = 2 / (period + 1);
+    const sma = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    const ema = Array(period - 1).fill(null);
+    ema.push(sma);
+    for (let i = period; i < prices.length; i++) {
+      ema.push((prices[i] * k) + (ema[ema.length - 1] * (1 - k)));
+    }
+    return ema;
+  }
+
+  calculateCorrelationAndBeta(prices1, prices2) {
+    if (prices1.length !== prices2.length || prices1.length < 2) {
+      return { correlation: 0, beta: 0 };
+    }
+    const n = prices1.length;
+    let sum1 = 0, sum2 = 0;
+    for (let i = 0; i < n; i++) { sum1 += prices1[i]; sum2 += prices2[i]; }
+    const mean1 = sum1 / n;
+    const mean2 = sum2 / n;
+    let cov = 0, var1 = 0, var2 = 0;
+    for (let i = 0; i < n; i++) {
+      const d1 = prices1[i] - mean1;
+      const d2 = prices2[i] - mean2;
+      cov += d1 * d2;
+      var1 += d1 * d1;
+      var2 += d2 * d2;
+    }
+    if (var1 === 0 || var2 === 0) {
+      return { correlation: 0, beta: 0 };
+    }
+    const correlation = cov / Math.sqrt(var1 * var2);
+    const beta = cov / var2;
+    return { correlation, beta };
+  }
+
+  calculateDownsideBeta(returns, marketReturns) {
+    let sumProduct = 0;
+    let sumSquaredMarket = 0;
+    for (let i = 0; i < marketReturns.length; i++) {
+      if (marketReturns[i] < 0) {
+        sumProduct += returns[i] * marketReturns[i];
+        sumSquaredMarket += marketReturns[i] * marketReturns[i];
+      }
+    }
+    return sumSquaredMarket === 0 ? 0 : sumProduct / sumSquaredMarket;
+  }
+
+  async fetchHistoricalTotal3(days = 90) {
+    try {
+      const [btcChart, ethChart, globalNow] = await Promise.all([
+        this.makeAPICall('/coins/bitcoin/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
+        this.makeAPICall('/coins/ethereum/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
+        this.makeAPICall('/global')
+      ]);
+      const btcCaps = btcChart?.market_caps || [];
+      const ethCaps = ethChart?.market_caps || [];
+      const len = Math.min(btcCaps.length, ethCaps.length);
+      if (len < 2) throw new Error('Insufficient BTC/ETH history');
+      const btcD = (globalNow?.data?.market_cap_percentage?.btc || 0) / 100;
+      const ethD = (globalNow?.data?.market_cap_percentage?.eth || 0) / 100;
+      const denom = Math.max(btcD + ethD, 1e-6);
+      const total3 = [];
+      for (let i = 0; i < len; i++) {
+        const totalMcap = (btcCaps[i][1] + ethCaps[i][1]) / denom;
+        total3.push(totalMcap * (1 - btcD - ethD));
+      }
+      return total3;
+    } catch (e) {
+      // Fallback to flat series using snapshot
+      try {
+        const g = await this.makeAPICall('/global');
+        const total = Number(g?.data?.total_market_cap?.usd || 0);
+        const btcD = Number(g?.data?.market_cap_percentage?.btc || 0) / 100;
+        const ethD = Number(g?.data?.market_cap_percentage?.eth || 0) / 100;
+        const t3 = total * (1 - btcD - ethD);
+        return Array.from({ length: days }, () => t3);
+      } catch {
+        return Array.from({ length: days }, () => 0);
+      }
+    }
+  }
+
+  async getCorrelationAnalysis(topCoins) {
+    const results = [];
+    // Limit to reduce rate limits during GitHub Actions run
+    const coinsToAnalyze = (topCoins || []).slice(0, 60);
+    const total3Prices = await this.fetchHistoricalTotal3(90);
+    const total3Returns = [];
+    for (let i = 1; i < total3Prices.length; i++) {
+      const prev = total3Prices[i - 1];
+      const curr = total3Prices[i];
+      if (prev === 0) { total3Returns.push(0); } else { total3Returns.push((curr - prev) / prev); }
+    }
+    for (const coin of coinsToAnalyze) {
+      try {
+        if (!coin?.id || coin.id === 'bitcoin' || coin.id === 'ethereum') continue;
+        const history = await this.makeAPICall(`/coins/${coin.id}/market_chart`, {
+          vs_currency: 'usd', days: 90, interval: 'daily'
+        });
+        if (!history.prices || history.prices.length < 2) continue;
+        const prices = history.prices.map(p => p[1]);
+        const returns = [];
+        for (let i = 1; i < prices.length; i++) {
+          const prev = prices[i - 1];
+          const curr = prices[i];
+          returns.push(prev === 0 ? 0 : (curr - prev) / prev);
+        }
+        const minLen = Math.min(returns.length, total3Returns.length);
+        if (minLen < 2) continue;
+        const { correlation, beta } = this.calculateCorrelationAndBeta(
+          returns.slice(-minLen), total3Returns.slice(-minLen)
+        );
+        const downsideBeta = this.calculateDownsideBeta(
+          returns.slice(-minLen), total3Returns.slice(-minLen)
+        );
+        results.push({
+          id: coin.id,
+          name: coin.name,
+          symbol: (coin.symbol || '').toUpperCase(),
+          currentPrice: coin.current_price,
+          marketCap: coin.market_cap,
+          priceChange24h: coin.price_change_percentage_24h,
+          correlation,
+          beta,
+          downsideBeta,
+          timestamp: new Date().toISOString()
+        });
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) {
+        console.warn(`Correlation calc failed for ${coin?.id}:`, e.message);
+      }
+    }
+    return results.sort((a, b) => b.marketCap - a.marketCap);
+  }
+
+  async getEMACrossovers(topCoins) {
+    const results = [];
+    const coinsToAnalyze = (topCoins || []).slice(0, 60);
+    for (const coin of coinsToAnalyze) {
+      try {
+        if (!coin?.id) continue;
+        const history = await this.makeAPICall(`/coins/${coin.id}/market_chart`, {
+          vs_currency: 'usd', days: 90, interval: 'daily'
+        });
+        if (!history.prices || history.prices.length < 55) continue;
+        const prices = history.prices.map(p => p[1]);
+        const ema21 = this.calculateEMA(prices, 21);
+        const ema55 = this.calculateEMA(prices, 55);
+        const lastIdx = prices.length - 1;
+        const firstValidIdx = 54; // max(21,55)-1
+        if (lastIdx <= firstValidIdx) continue;
+        let lastCrossoverIdx = -1;
+        let lastCrossoverType = 'none';
+        for (let j = firstValidIdx + 1; j <= lastIdx; j++) {
+          if (ema21[j] == null || ema55[j] == null || ema21[j-1] == null || ema55[j-1] == null) continue;
+          const prevDiff = ema21[j-1] - ema55[j-1];
+          const currDiff = ema21[j] - ema55[j];
+          if (prevDiff < 0 && currDiff > 0) { lastCrossoverIdx = j; lastCrossoverType = 'bullish'; }
+          else if (prevDiff > 0 && currDiff < 0) { lastCrossoverIdx = j; lastCrossoverType = 'bearish'; }
+        }
+        const lookbackBars = 3;
+        let signal = 'none';
+        let daysAgo = null;
+        const currentEma21 = ema21[lastIdx];
+        const currentEma55 = ema55[lastIdx];
+        if (lastCrossoverIdx !== -1 && lastIdx - lastCrossoverIdx <= lookbackBars) {
+          signal = lastCrossoverType;
+          daysAgo = lastIdx - lastCrossoverIdx;
+        }
+        results.push({
+          id: coin.id,
+          name: coin.name,
+          symbol: (coin.symbol || '').toUpperCase(),
+          currentPrice: coin.current_price,
+          priceChange24h: coin.price_change_percentage_24h,
+          ema21: currentEma21,
+          ema55: currentEma55,
+          daysAgo,
+          signal,
+          timestamp: new Date().toISOString()
+        });
+        await new Promise(r => setTimeout(r, 800));
+      } catch (e) {
+        console.warn(`EMA calc failed for ${coin?.id}:`, e.message);
+      }
+    }
+    const bullCount = results.filter(r => r.signal === 'bullish').length;
+    const bearCount = results.filter(r => r.signal === 'bearish').length;
+    console.log(`✅ EMA crossovers — Bullish: ${bullCount}, Bearish: ${bearCount}, Total: ${results.length}`);
+    return results;
+  }
+
   // HTTP request function
   makeRequest(url, headers = {}) {
     return new Promise((resolve, reject) => {
@@ -420,6 +614,11 @@ class CryptoDataGenerator {
       const globalMetrics = await this.getGlobalMetrics();
       const btcData = await this.getBTCData();
       const narrativeData = await this.getNarrativeData();
+      // Compute technical analyses for cache consumers to avoid live API in serverless
+      const emaCrossovers = await this.getEMACrossovers(topPerformers.allCoins);
+      const corrFull = await this.getCorrelationAnalysis(topPerformers.allCoins);
+      const topCorrelated = [...corrFull].sort((a, b) => b.correlation - a.correlation).slice(0, 10);
+      const topDownsideBeta = [...corrFull].sort((a, b) => b.downsideBeta - a.downsideBeta).slice(0, 10);
       
       // Prepare complete data structure
       const dailyData = {
@@ -431,6 +630,11 @@ class CryptoDataGenerator {
         globalMetrics,
         btcData,
         narrativeData,
+        emaCrossovers,
+        correlationAnalysis: {
+          topCorrelated,
+          topDownsideBeta
+        },
         metadata: {
           totalCoinsAnalyzed: topPerformers.allCoins.length,
           apiMode: this.API_KEY ? 'pro' : 'free',
