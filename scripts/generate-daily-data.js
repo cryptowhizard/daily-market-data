@@ -21,13 +21,20 @@ function getDateKeyNY() {
 class CryptoDataGenerator {
   constructor() {
     this.API_KEY = process.env.COINGECKO_API_KEY;
-    this.BASE_URL = this.API_KEY ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
+    this.isPro = !!this.API_KEY;
+    this.BASE_URL = this.isPro ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
     this.cache = new Map();
     this.CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-    
+    this.minDelayMs = this.isPro ? 300 : 1600; // minimal spacing between calls
+    this.maxRetries = this.isPro ? 3 : 6; // retry more on free
+    this.backoffBaseMs = this.isPro ? 500 : 2000;
+    this.lastRequestTime = 0;
+    this.freeModeForced = false; // becomes true if we auto-downgrade from PRO
+
     console.log('🔑 GitHub Actions - API Configuration:');
-    console.log(`   - Using ${this.API_KEY ? 'PRO' : 'FREE'} CoinGecko API`);
+    console.log(`   - Using ${this.isPro ? 'PRO' : 'FREE'} CoinGecko API`);
     console.log(`   - Base URL: ${this.BASE_URL}`);
+    console.log(`   - Min delay: ${this.minDelayMs}ms, Max retries: ${this.maxRetries}`);
   }
 
   // === Technical helpers reused from API ===
@@ -79,13 +86,60 @@ class CryptoDataGenerator {
     return sumSquaredMarket === 0 ? 0 : sumProduct / sumSquaredMarket;
   }
 
+  // === Rate limit & retry helpers ===
+  sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async enforceRateLimit() {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    if (elapsed < this.minDelayMs) {
+      await this.sleep(this.minDelayMs - elapsed);
+    }
+    this.lastRequestTime = Date.now();
+  }
+
+  randomJitter(ms) {
+    const jitter = Math.floor(Math.random() * Math.min(500, Math.max(100, ms * 0.1)));
+    return ms + jitter;
+  }
+
+  computeBackoffDelay(attempt, retryAfterHeader) {
+    if (retryAfterHeader) {
+      const ra = Number(retryAfterHeader);
+      if (!isNaN(ra) && ra > 0) return (ra * 1000);
+    }
+    // exponential backoff with cap
+    const base = this.backoffBaseMs * Math.pow(2, attempt);
+    return Math.min(30000, this.randomJitter(base));
+  }
+
+  downgradeToFree() {
+    if (!this.isPro) return;
+    console.warn('🔁 Downgrading to FREE API due to auth failure on PRO');
+    this.isPro = false;
+    this.API_KEY = null;
+    this.BASE_URL = 'https://api.coingecko.com/api/v3';
+    this.minDelayMs = 1600;
+    this.maxRetries = 6;
+    this.backoffBaseMs = 2000;
+    this.freeModeForced = true;
+  }
+
   async fetchHistoricalTotal3(days = 90) {
     try {
-      const [btcChart, ethChart, globalNow] = await Promise.all([
-        this.makeAPICall('/coins/bitcoin/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
-        this.makeAPICall('/coins/ethereum/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
-        this.makeAPICall('/global')
-      ]);
+      let btcChart, ethChart, globalNow;
+      if (this.isPro) {
+        [btcChart, ethChart, globalNow] = await Promise.all([
+          this.makeAPICall('/coins/bitcoin/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
+          this.makeAPICall('/coins/ethereum/market_chart', { vs_currency: 'usd', days, interval: 'daily' }),
+          this.makeAPICall('/global')
+        ]);
+      } else {
+        // On FREE, avoid parallel bursts
+        btcChart = await this.makeAPICall('/coins/bitcoin/market_chart', { vs_currency: 'usd', days, interval: 'daily' });
+        ethChart = await this.makeAPICall('/coins/ethereum/market_chart', { vs_currency: 'usd', days, interval: 'daily' });
+        globalNow = await this.makeAPICall('/global');
+      }
       const btcCaps = btcChart?.market_caps || [];
       const ethCaps = ethChart?.market_caps || [];
       const len = Math.min(btcCaps.length, ethCaps.length);
@@ -159,7 +213,7 @@ class CryptoDataGenerator {
           downsideBeta,
           timestamp: new Date().toISOString()
         });
-        await new Promise(r => setTimeout(r, 500));
+        await this.sleep(this.isPro ? 500 : 2200);
       } catch (e) {
         console.warn(`Correlation calc failed for ${coin?.id}:`, e.message);
       }
@@ -213,7 +267,7 @@ class CryptoDataGenerator {
           signal,
           timestamp: new Date().toISOString()
         });
-        await new Promise(r => setTimeout(r, 800));
+        await this.sleep(this.isPro ? 800 : 2500);
       } catch (e) {
         console.warn(`EMA calc failed for ${coin?.id}:`, e.message);
       }
@@ -236,9 +290,9 @@ class CryptoDataGenerator {
         requestHeaders['x-cg-pro-api-key'] = this.API_KEY;
       }
 
-      const options = { headers: requestHeaders };
+      const options = { headers: requestHeaders, timeout: 20000 };
 
-      https.get(url, options, (res) => {
+      const req = https.get(url, options, (res) => {
         let data = '';
         
         res.on('data', (chunk) => {
@@ -246,18 +300,33 @@ class CryptoDataGenerator {
         });
         
         res.on('end', () => {
-          if (res.statusCode === 401) {
-            reject(new Error('Unauthorized - Check your API key'));
+          const retryAfter = res.headers ? (res.headers['retry-after'] || res.headers['Retry-After']) : undefined;
+          if (res.statusCode === 401 || res.statusCode === 403) {
+            const err = new Error('Unauthorized - Check your API key');
+            err.statusCode = res.statusCode;
+            reject(err);
             return;
           }
           
           if (res.statusCode === 429) {
-            reject(new Error('Rate limited - Too many requests'));
+            const err = new Error('Rate limited - Too many requests');
+            err.statusCode = 429;
+            if (retryAfter) err.retryAfter = retryAfter;
+            reject(err);
+            return;
+          }
+          
+          if (res.statusCode && res.statusCode >= 500) {
+            const err = new Error(`Server error ${res.statusCode}`);
+            err.statusCode = res.statusCode;
+            reject(err);
             return;
           }
           
           if (res.statusCode !== 200) {
-            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+            const err = new Error(`HTTP ${res.statusCode}: ${data}`);
+            err.statusCode = res.statusCode;
+            reject(err);
             return;
           }
 
@@ -268,7 +337,13 @@ class CryptoDataGenerator {
             reject(new Error(`JSON parse error: ${error.message}`));
           }
         });
-      }).on('error', (error) => {
+      });
+
+      req.on('timeout', () => {
+        req.destroy(new Error('Request timeout'));
+      });
+
+      req.on('error', (error) => {
         reject(error);
       });
     });
@@ -276,8 +351,8 @@ class CryptoDataGenerator {
 
   async makeAPICall(endpoint, params = {}) {
     const queryString = new URLSearchParams(params).toString();
-    const url = `${this.BASE_URL}${endpoint}${queryString ? '?' + queryString : ''}`;
-    const cacheKey = url;
+    const buildUrl = () => `${this.BASE_URL}${endpoint}${queryString ? '?' + queryString : ''}`;
+    const cacheKey = `${endpoint}|${queryString}`; // cache key decoupled from base URL
     
     const cached = this.cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < this.CACHE_DURATION) {
@@ -285,28 +360,41 @@ class CryptoDataGenerator {
       return cached.data;
     }
 
-    try {
-      console.log(`🌐 API call: ${endpoint}`);
-      const data = await this.makeRequest(url);
-      
-      this.cache.set(cacheKey, {
-        data: data,
-        timestamp: Date.now()
-      });
-      
-      // Add delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      return data;
-    } catch (error) {
-      console.error(`❌ API call failed: ${endpoint}`, error.message);
-      
-      if (cached) {
-        console.log('📦 Using stale cache data');
-        return cached.data;
+    let attempt = 0;
+    while (attempt <= this.maxRetries) {
+      try {
+        await this.enforceRateLimit();
+        const url = buildUrl();
+        console.log(`🌐 API call: ${endpoint} (attempt ${attempt + 1}/${this.maxRetries + 1})`);
+        const data = await this.makeRequest(url);
+        this.cache.set(cacheKey, { data, timestamp: Date.now() });
+        return data;
+      } catch (error) {
+        const sc = error && error.statusCode;
+        // Auto-downgrade from PRO to FREE on auth failure
+        if ((sc === 401 || sc === 403) && this.isPro) {
+          this.downgradeToFree();
+          attempt++;
+          continue;
+        }
+        // Retry on 429 / 5xx / transient network errors
+        const transient = sc === 429 || (sc && sc >= 500) ||
+          (error && ['ECONNRESET','ETIMEDOUT','EAI_AGAIN','ENOTFOUND'].includes(error.code));
+        if (transient && attempt < this.maxRetries) {
+          const delay = this.computeBackoffDelay(attempt, error && error.retryAfter);
+          console.warn(`⏳ Retry ${attempt + 1} for ${endpoint} in ${delay}ms (reason: ${error.message})`);
+          await this.sleep(delay);
+          attempt++;
+          continue;
+        }
+
+        console.error(`❌ API call failed: ${endpoint}`, error.message);
+        if (cached) {
+          console.log('📦 Using stale cache data');
+          return cached.data;
+        }
+        throw error;
       }
-      
-      throw error;
     }
   }
 
@@ -327,7 +415,7 @@ class CryptoDataGenerator {
         order: 'market_cap_desc',
         per_page: coinsToFetch,
         page: page,
-        sparkline: false,
+        sparkline: this.isPro ? false : true,
         price_change_percentage: '24h,7d'
       });
 
@@ -340,7 +428,7 @@ class CryptoDataGenerator {
       
       // Add delay between requests to avoid rate limiting
       if (page < pages) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await this.sleep(this.isPro ? 400 : 2200);
       }
     }
 
@@ -362,8 +450,9 @@ class CryptoDataGenerator {
       .slice(0, 15);
 
     const topGainers7d = allCoins
-      .filter(coin => coin.price_change_percentage_7d_in_currency != null && coin.price_change_percentage_7d_in_currency > 0)
-      .sort((a, b) => b.price_change_percentage_7d_in_currency - a.price_change_percentage_7d_in_currency)
+      .map(c => ({ ...c, _7d: this.get7dChange(c) }))
+      .filter(c => c._7d != null && c._7d > 0)
+      .sort((a, b) => b._7d - a._7d)
       .slice(0, 15);
 
     console.log(`✅ Found ${topGainers24h.length} gainers, ${topLosers24h.length} losers, ${topGainers7d.length} weekly winners`);
@@ -506,7 +595,8 @@ class CryptoDataGenerator {
           vs_currency: 'usd',
           ids: batch.join(','),
           price_change_percentage: '24h,7d',
-          per_page: 250
+          per_page: 250,
+          sparkline: this.isPro ? false : true
         });
         
         if (Array.isArray(response)) {
@@ -514,7 +604,7 @@ class CryptoDataGenerator {
         }
         
         // Add delay between batches
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await this.sleep(this.isPro ? 600 : 2000);
       }
       
       // Create a map of coin data for easy access
@@ -526,7 +616,7 @@ class CryptoDataGenerator {
           symbol: coin.symbol.toUpperCase(),
           current_price: coin.current_price,
           price_change_percentage_24h: (coin.price_change_percentage_24h_in_currency ?? coin.price_change_percentage_24h ?? 0),
-          price_change_percentage_7d: (coin.price_change_percentage_7d_in_currency ?? 0),
+          price_change_percentage_7d: (this.get7dChange(coin) ?? 0),
           market_cap: coin.market_cap || 0,
           image: coin.image
         };
@@ -594,6 +684,18 @@ class CryptoDataGenerator {
     if (num >= 1e6) return (num / 1e6).toFixed(decimals) + 'M';
     if (num >= 1e3) return (num / 1e3).toFixed(decimals) + 'K';
     return num.toFixed(decimals);
+  }
+
+  // Fallback computation for 7d change using sparkline when API omits price_change_percentage_7d_in_currency on FREE
+  get7dChange(coin) {
+    if (coin == null) return null;
+    if (coin.price_change_percentage_7d_in_currency != null) return coin.price_change_percentage_7d_in_currency;
+    const spark = coin.sparkline_in_7d && Array.isArray(coin.sparkline_in_7d.price) ? coin.sparkline_in_7d.price : null;
+    if (!spark || spark.length < 2) return null;
+    const first = spark[0];
+    const last = spark[spark.length - 1];
+    if (!first || first === 0) return null;
+    return ((last - first) / first) * 100; // percent
   }
 
   ensureDirectoryExists(dirPath) {
