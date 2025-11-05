@@ -534,6 +534,42 @@ class CryptoDataGenerator {
     }
   }
 
+  async getETHData() {
+    console.log('Ξ Fetching ETH data...');
+    try {
+      const data = await this.makeAPICall('/coins/ethereum', {
+        localization: false,
+        tickers: false,
+        market_data: true,
+        community_data: false,
+        developer_data: false,
+        sparkline: false
+      });
+
+      const currentPrice = data.market_data?.current_price?.usd || 0;
+      const priceChange24h = data.market_data?.price_change_percentage_24h || 0;
+      const marketCap = data.market_data?.market_cap?.usd || 0;
+
+      let trend = 'neutral';
+      if (priceChange24h > 2) trend = 'strong_bull';
+      else if (priceChange24h > 0.5) trend = 'bullish';
+      else if (priceChange24h < -2) trend = 'strong_bear';
+      else if (priceChange24h < -0.5) trend = 'bearish';
+
+      console.log(`✅ ETH: $${currentPrice.toLocaleString()} (${priceChange24h > 0 ? '+' : ''}${priceChange24h.toFixed(2)}%), Trend: ${trend}`);
+
+      return {
+        currentPrice,
+        priceChange24h,
+        marketCap,
+        trend
+      };
+    } catch (error) {
+      console.error('⚠️ ETH data error:', error.message);
+      throw error;
+    }
+  }
+
   async getNarrativeData() {
     console.log('📊 Generating narrative data...');
     
@@ -715,6 +751,7 @@ class CryptoDataGenerator {
       const topPerformers = await this.getTopPerformers();
       const globalMetrics = await this.getGlobalMetrics();
       const btcData = await this.getBTCData();
+      const ethData = await this.getETHData();
       const narrativeData = await this.getNarrativeData();
       // Compute technical analyses for cache consumers to avoid live API in serverless
       const emaCrossovers = await this.getEMACrossovers(topPerformers.allCoins);
@@ -731,6 +768,7 @@ class CryptoDataGenerator {
         topGainers7d: topPerformers.topGainers7d,
         globalMetrics,
         btcData,
+        ethData,
         narrativeData,
         emaCrossovers,
         correlationAnalysis: {
@@ -750,6 +788,8 @@ class CryptoDataGenerator {
       console.log(`   - Top losers: ${dailyData.topLosers24h.length}`);
       console.log(`   - Weekly winners: ${dailyData.topGainers7d.length}`);
       console.log(`   - BTC price: $${dailyData.btcData.currentPrice?.toLocaleString()}`);
+      console.log(`   - ETH price: $${dailyData.ethData.currentPrice?.toLocaleString()}`);
+      console.log(`   - ETH price: $${ethData.currentPrice?.toLocaleString()}`);
       console.log(`   - Market cap: ${this.formatNumber(dailyData.globalMetrics.totalMarketCap)}`);
       console.log(`   - Narratives: ${Object.keys(dailyData.narrativeData).length}`);
 
